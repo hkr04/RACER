@@ -106,4 +106,4 @@ CUDA_VISIBLE_DEVICES=0 python -m racer.inference.webui --model-path qwen/qwen3-1
 
 ## Acknowledgement
 
-This work was supported by the National Science and Technology Major Project (No. 2023ZD0121502) and Huawei openPangu project.
+We would like to thank [openPangu](https://huggingface.co/openpangu/models) for its support. openPangu is a trademark of Huawei Technologies Co., Ltd. For more information, please refer to the official openPangu repository and the accompanying license files.
