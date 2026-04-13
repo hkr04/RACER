@@ -1,0 +1,18 @@
+torch
+torchvision
+fschat[model_worker,webui]
+maturin==0.12
+numpy==1.26.1
+tqdm==4.66.1
+transformers==4.52.3
+accelerate==1.10.1
+qwen-vl-utils[decord]==0.0.8
+datasets
+openai
+anthropic
+sentencepiece
+protobuf
+shortuuid
+sacrebleu
+
+-e ./racer/automaton
