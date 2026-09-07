@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <iostream>
 #include <memory>
+#include <utility>
+#include <cstdlib>
 
 struct TrieNode {
     std::unordered_map<int, TrieNode*> children;
@@ -37,24 +39,19 @@ struct DraftBuffer {
     std::vector<std::vector<int>> retrieve_indices;
 };
 
+class Trie;
+
+struct RefillStats {
+    int new_nodes = 0;
+    int reused_nodes = 0;
+};
+
 // Logits Tree construction.
 // RACER Sec. 3.1, Eq. (3) and Appendix E.1, Algorithm 1.
 class TokenBin {
 private:
     std::vector<std::vector<int>> adj_matrix;
     int top_k;
-
-    struct Node {
-        int token;
-        int pos_parent;
-        int breadth;
-        int depth;
-
-        Node(int token, int pos_parent, int breadth, int depth)
-        : token(token), pos_parent(pos_parent), breadth(breadth), depth(depth) {
-
-        }
-    };
 
 public:
     TokenBin(int vocab_size, int top_k) : top_k(top_k) {
@@ -79,56 +76,17 @@ public:
         }
     }
 
-    std::vector<std::vector<int>> retrieve(int next_token, int max_num_draft, bool is_chain = false) {
-        if (next_token >= adj_matrix.size()) {
-            return {{next_token}};
-        }
-
-        std::vector<std::vector<int>> candidates;
-
-        std::vector<Node> q;
-
-        // Algorithm 1: the sampled next token is the draft-tree root
-        // and consumes one slot from the fixed draft capacity.
-        q.emplace_back(next_token, -1, is_chain ? 1 : top_k, 0);
-        max_num_draft--;
-
-        size_t head = 0;
-
-        while (head < q.size()) {
-            auto u = q[head++];
-
-            int pos_u = head - 1; 
-            int breadth = u.breadth, depth = u.depth, token = u.token;
-
-            if (max_num_draft > 0 && breadth > 0 && token < adj_matrix.size()) {
-                // RACER Sec. 3.1, Eq. (3) / Appendix E.1, Algorithm 1:
-                // the root starts from the full breadth; deeper nodes start
-                // from half of their parent's breadth.
-                int next_breadth = depth == 0 ? breadth : (breadth >> 1);
-                int next_depth = depth + 1;
-                for (int i = 0; i < breadth && max_num_draft > 0; i++) {
-                    int child = adj_matrix[token][i];
-                    // Eq. (3): later siblings receive progressively smaller breadth.
-                    q.emplace_back(child, pos_u, std::max(1, next_breadth), next_depth);
-                    next_breadth >>= 1;
-                    max_num_draft--;
-                }
-            } else { // Leaf node
-                std::vector<int> candidate;
-
-                while (pos_u >= 0) {
-                    candidate.push_back(q[pos_u].token);
-                    pos_u = q[pos_u].pos_parent;
-                }
-
-                // leaf to root -> root to leaf
-                candidates.emplace_back(candidate.rbegin(), candidate.rend());
-            }
-        }
-
-        return candidates;
-    }
+    // Expand the Logits Tree directly into the merged candidate trie.
+    // Breadth follows the logical Logits Tree; capacity follows unique
+    // merged nodes (excluding the sentinel root).
+    void refill(
+        Trie& candidate_trie,
+        TrieNode* start_node,
+        int start_token,
+        int max_num_draft,
+        bool is_chain = false,
+        RefillStats* stats = nullptr
+    );
 };
 
 class Trie {
@@ -204,6 +162,53 @@ public:
 
     int node_count() const {
         return std::min(_node_count, static_cast<int>(nodes.size()));
+    }
+
+    // Unique draft tokens in this trie, excluding the sentinel root.
+    int draft_size() const {
+        return node_count() - 1;
+    }
+
+    TrieNode* root_node() const {
+        return root;
+    }
+
+    // Look up or insert a child without LRU eviction.
+    // If the child already exists, it is reused and does not consume budget.
+    // If the unique draft capacity is full, new children are not created.
+    std::pair<TrieNode*, bool> get_or_add_child_no_evict(
+        TrieNode* parent,
+        int token,
+        int max_num_draft
+    ) {
+        assert(parent != nullptr);
+        auto it = parent->children.find(token);
+        if (it != parent->children.end()) {
+            return {it->second, false};
+        }
+        if (draft_size() >= max_num_draft) {
+            return {nullptr, false};
+        }
+        assert(node_count() < static_cast<int>(nodes.size()));
+        TrieNode* new_node = get_new_node();
+        new_node->parent = parent;
+        new_node->token = token;
+        new_node->depth = parent->depth + 1;
+        parent->children[token] = new_node;
+        return {new_node, true};
+    }
+
+    // Walk an existing path, creating missing nodes until capacity is reached.
+    TrieNode* ensure_path_no_evict(const std::vector<int>& path, int max_num_draft) {
+        TrieNode* u = root;
+        for (int token : path) {
+            auto added = get_or_add_child_no_evict(u, token, max_num_draft);
+            if (added.first == nullptr) {
+                break;
+            }
+            u = added.first;
+        }
+        return u;
     }
 
     // RACER Appendix E.3, Algorithm 3: INSERTTOKENS
@@ -305,6 +310,89 @@ public:
         return buf;
     }
 };
+
+inline bool refill_stats_enabled() {
+    const char* env = std::getenv("RACER_REFILL_STATS");
+    return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+// Defined after Trie so refill can call unique-node helpers without
+// reordering the rest of this file.
+inline void TokenBin::refill(
+    Trie& candidate_trie,
+    TrieNode* start_node,
+    int start_token,
+    int max_num_draft,
+    bool is_chain,
+    RefillStats* stats
+) {
+    if (start_node == nullptr || max_num_draft <= 0) {
+        return;
+    }
+
+    struct RefillState {
+        TrieNode* trie_node;
+        int token;
+        int breadth;
+        int depth;
+    };
+
+    std::vector<RefillState> q;
+    std::unordered_map<TrieNode*, int> scheduled_breadth;
+
+    const int init_breadth = is_chain ? 1 : top_k;
+    q.push_back({start_node, start_token, init_breadth, 0});
+    scheduled_breadth[start_node] = init_breadth;
+
+    size_t head = 0;
+    while (head < q.size()) {
+        const RefillState u = q[head++];
+
+        if (u.breadth <= 0 || u.token < 0 || static_cast<size_t>(u.token) >= adj_matrix.size()) {
+            continue;
+        }
+
+        // RACER Sec. 3.1, Eq. (3) / Appendix E.1, Algorithm 1:
+        // the root starts from the full breadth; deeper nodes start
+        // from half of their parent's breadth.
+        int next_breadth = u.depth == 0 ? u.breadth : (u.breadth >> 1);
+        const int next_depth = u.depth + 1;
+
+        for (int i = 0; i < u.breadth; ++i) {
+            const int child_token = adj_matrix[u.token][i];
+            // Eq. (3): later siblings receive progressively smaller breadth.
+            // Rank still determines breadth even when the child already exists.
+            const int child_breadth = std::max(1, next_breadth);
+            next_breadth >>= 1;
+
+            auto added = candidate_trie.get_or_add_child_no_evict(
+                u.trie_node, child_token, max_num_draft);
+            TrieNode* child = added.first;
+            const bool inserted = added.second;
+
+            if (child == nullptr) {
+                continue;
+            }
+
+            if (stats != nullptr) {
+                if (inserted) {
+                    ++stats->new_nodes;
+                } else {
+                    ++stats->reused_nodes;
+                }
+            }
+
+            auto sit = scheduled_breadth.find(child);
+            if (sit != scheduled_breadth.end()) {
+                // First visit keeps the (largest) rank-0 breadth.
+                assert(child_breadth <= sit->second);
+                continue;
+            }
+            scheduled_breadth.emplace(child, child_breadth);
+            q.push_back({child, child_token, child_breadth, next_depth});
+        }
+    }
+}
 
 class Automaton : public Trie {
 private:
@@ -502,12 +590,15 @@ public:
             top_k.pop();
             selected.insert(pair);
         }
-        
-        // Including an empty node for root
+
+        // Including an empty node for root.
+        // max_num_draft counts unique draft nodes excluding the sentinel root.
         Trie candidate_trie(max_num_draft + 1);
 
         std::vector<int> candidate;
         candidate.push_back(next_token); // In case no border is selected
+
+        const int retrieval_selected_states = static_cast<int>(selected.size());
 
         for (auto [u, start_u] : selected) {
             bool is_candidate_leaf = true;
@@ -533,17 +624,65 @@ public:
             }
         }
 
+        const int retrieval_merged_nodes = candidate_trie.draft_size();
+
         if (token_bin) {
-            // Step 3: Give the remaining fixed draft capacity to Logits Tree.
-            // RACER Sec. 3.3.
-            auto aux_candidates = token_bin->retrieve(is_chain ? candidate.back() : next_token, max_num_draft - selected.size(), is_chain);
-            // Step 4: Merge retrieval and logits candidates by trie union.
-            // RACER Sec. 3.3.
-            for (auto aux_candidate : aux_candidates) {
-                if (is_chain) {
-                    aux_candidate.insert(aux_candidate.begin(), candidate.begin(), candidate.end() - 1);
+            // Step 3: Refill Logits Tree into the merged candidate trie.
+            // Repeated prefixes do not consume unique-node budget.
+            TrieNode* start_node = nullptr;
+            int start_token = next_token;
+            RefillStats refill_stats;
+
+            if (is_chain) {
+                const int size_before = candidate_trie.draft_size();
+                start_node = candidate_trie.ensure_path_no_evict(candidate, max_num_draft);
+                if (start_node == nullptr || start_node == candidate_trie.root_node()) {
+                    auto added = candidate_trie.get_or_add_child_no_evict(
+                        candidate_trie.root_node(), candidate.back(), max_num_draft);
+                    start_node = added.first;
                 }
-                candidate_trie.insert(aux_candidate);
+                if (start_node != nullptr && start_node != candidate_trie.root_node()) {
+                    start_token = start_node->token;
+                }
+                refill_stats.new_nodes += candidate_trie.draft_size() - size_before;
+                if (candidate_trie.draft_size() == size_before &&
+                    start_node != nullptr &&
+                    start_node != candidate_trie.root_node()) {
+                    ++refill_stats.reused_nodes;
+                }
+            } else {
+                auto added = candidate_trie.get_or_add_child_no_evict(
+                    candidate_trie.root_node(), next_token, max_num_draft);
+                start_node = added.first;
+                start_token = next_token;
+                if (added.second) {
+                    ++refill_stats.new_nodes;
+                } else if (start_node != nullptr) {
+                    ++refill_stats.reused_nodes;
+                }
+            }
+
+            if (start_node != nullptr && start_node != candidate_trie.root_node()) {
+                token_bin->refill(
+                    candidate_trie,
+                    start_node,
+                    start_token,
+                    max_num_draft,
+                    is_chain,
+                    &refill_stats
+                );
+            }
+
+            if (refill_stats_enabled()) {
+                const int final_draft_nodes = candidate_trie.draft_size();
+                std::cerr << "[RACER_REFILL_STATS]"
+                          << " retrieval_selected_states=" << retrieval_selected_states
+                          << " retrieval_merged_nodes=" << retrieval_merged_nodes
+                          << " logits_new_nodes=" << refill_stats.new_nodes
+                          << " logits_reused_nodes=" << refill_stats.reused_nodes
+                          << " final_draft_nodes=" << final_draft_nodes
+                          << " unused_slots=" << (max_num_draft - final_draft_nodes)
+                          << std::endl;
             }
         }
 
