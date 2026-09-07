@@ -3,6 +3,9 @@
 # Generated files
 *.idx
 
+# Cython generated source
+racer/automaton/automaton.cpp
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
