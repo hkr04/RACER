@@ -37,6 +37,8 @@ struct DraftBuffer {
     std::vector<std::vector<int>> retrieve_indices;
 };
 
+// Logits Tree construction.
+// RACER Sec. 3.1, Eq. (3) and Appendix E.1, Algorithm 1.
 class TokenBin {
 private:
     std::vector<std::vector<int>> adj_matrix;
@@ -61,6 +63,8 @@ public:
             adj_vec.resize(top_k);
         }
         adj_matrix.shrink_to_fit();
+        // Rows not observed yet intentionally remain zero-filled and act as
+        // padding/fallback entries until cached logits are available.
     }
 
     void update(const std::vector<int>& input_ids, const std::vector<std::vector<int>>& adj_vectors) {
@@ -84,6 +88,8 @@ public:
 
         std::vector<Node> q;
 
+        // Algorithm 1: the sampled next token is the draft-tree root
+        // and consumes one slot from the fixed draft capacity.
         q.emplace_back(next_token, -1, is_chain ? 1 : top_k, 0);
         max_num_draft--;
 
@@ -96,10 +102,14 @@ public:
             int breadth = u.breadth, depth = u.depth, token = u.token;
 
             if (max_num_draft > 0 && breadth > 0 && token < adj_matrix.size()) {
-                int next_breadth = depth == 1 ? breadth : (breadth >> 1);
+                // RACER Sec. 3.1, Eq. (3) / Appendix E.1, Algorithm 1:
+                // the root starts from the full breadth; deeper nodes start
+                // from half of their parent's breadth.
+                int next_breadth = depth == 0 ? breadth : (breadth >> 1);
                 int next_depth = depth + 1;
                 for (int i = 0; i < breadth && max_num_draft > 0; i++) {
                     int child = adj_matrix[token][i];
+                    // Eq. (3): later siblings receive progressively smaller breadth.
                     q.emplace_back(child, pos_u, std::max(1, next_breadth), next_depth);
                     next_breadth >>= 1;
                     max_num_draft--;
@@ -125,11 +135,13 @@ class Trie {
 protected:
     TrieNode* root = nullptr;
     std::vector<TrieNode> nodes;
+    // RACER Appendix E.3, Algorithm 3: LRU_LIST + LRU_MAP
     std::list<TrieNode*> lru_list;
     std::unordered_map<TrieNode*, std::list<TrieNode*>::iterator> lru_map;
     TrieNode* _cur_state;
     int _node_count;
 
+    // RACER Appendix E.3, Algorithm 3: TOUCH
     void touch(TrieNode* node) {
         auto it = lru_map.find(node);
         assert(it != lru_map.end());
@@ -137,6 +149,8 @@ protected:
         lru_map[node] = lru_list.begin();
     }
 
+    // RACER Appendix E.3, Algorithm 3: TOUCHPREFIX
+    // Failure links are reset to root and remain lazy until the next rebuild.
     void touch_prefix(TrieNode* node) {
         while (node) {
             if (root == nullptr) {
@@ -152,8 +166,10 @@ protected:
         }
     }
 
+    // RACER Appendix E.3, Algorithm 3: LRU node recycle/reset
     TrieNode* get_new_node() {
-        // Ensure the last node in the LRU list is empty
+        // RACER Sec. 3.2 / Appendix E.3, Algorithm 3:
+        // prefix touching preserves the leaf-only LRU eviction invariant.
         assert(lru_list.back()->children.empty());
         TrieNode* node = lru_list.back();
         if (node->parent) {
@@ -174,8 +190,8 @@ protected:
     }
 
 public:
-    Trie(int max_nodes) : nodes(max_nodes) {
-        max_nodes = std::max(max_nodes, 1);
+    Trie(int max_nodes)
+        : nodes(std::max(max_nodes, 1)) {
         _node_count = 0;
         for (auto& node : nodes) {
             node.clear();
@@ -190,6 +206,7 @@ public:
         return std::min(_node_count, static_cast<int>(nodes.size()));
     }
 
+    // RACER Appendix E.3, Algorithm 3: INSERTTOKENS
     void insert(const std::vector<int>& pattern, int freq = 1) {
         TrieNode* u = root;
         u->freq += freq;
@@ -220,7 +237,7 @@ public:
     }
 
     DraftBuffer flatten() {
-        // Initialize the buffer
+        // Tree Attention, Sec. 2, Eq. (2).
         DraftBuffer buf;
 
         int trie_size = node_count() - 1; // Without root
@@ -252,6 +269,8 @@ public:
 
             auto pos_u = visited - 1, pos_parent = seq_pos[parent]; 
 
+            // Tree Attention, Sec. 2, Eq. (2):
+            // draft position IDs are determined by tree depth.
             buf.position_ids.push_back(u->depth - 1);
             buf.tree_candidates.push_back(u->token);
 
@@ -259,6 +278,8 @@ public:
                 std::copy(buf.attn_mask[pos_parent].begin(), buf.attn_mask[pos_parent].end(), buf.attn_mask[pos_u].begin());
             }
 
+            // Tree Attention, Sec. 2, Eq. (2):
+            // each draft node attends only to itself and its ancestors.
             buf.attn_mask[pos_u][pos_u] = 1;
 
             for (const auto& [_, child] : u->children) {
@@ -291,9 +312,9 @@ private:
     std::unique_ptr<TokenBin> token_bin = nullptr;
 
 public:
-    Automaton(int max_nodes, int min_depth = 2) : Trie(max_nodes), min_depth(min_depth) {
-        min_depth = std::max(min_depth, 1);
-    }
+    Automaton(int max_nodes, int min_depth = 2)
+        : Trie(max_nodes),
+          min_depth(std::max(min_depth, 1)) {}
 
     void init_logits(int vocab_size, int top_k) {
         token_bin = std::make_unique<TokenBin>(vocab_size, top_k);
@@ -305,6 +326,11 @@ public:
         }
     }
 
+    // Build Aho-Corasick failure links.
+    // RACER Appendix E.2, Algorithm 2.
+    //
+    // In full RACER, failure links are rebuilt after prefill and
+    // subsequently updated lazily as described in Sec. 3.2.
     void build() {
         std::queue<TrieNode*> q;
         for (const auto& [_, child] : root->children) {
@@ -329,6 +355,7 @@ public:
         }
     }
 
+    // RACER Appendix E.3, Algorithm 3: TRANSTOKENS
     void trans_tokens(const std::vector<int>& tokens) {
         auto& u = _cur_state;
         for (const auto& token : tokens) {
@@ -337,6 +364,10 @@ public:
                 while (u != root && !u->children.count(token)) {
                     u = u->fail; // Keep going up the trie until we find a match or reach the root
                 }
+                // RACER Sec. 3.2 / Appendix E.3:
+                // TouchPrefix is applied after a failure-link fallback so that
+                // the matched prefix path is marked recent and its fail links
+                // remain lazy until the next rebuild.
                 touch_prefix(u); // Update the prefix after fail transition
             }
             if (u->children.count(token)) { // Otherwise we reach the root
@@ -357,7 +388,9 @@ public:
 
         bool state_updated = false;
 
-        // Get borders
+        // Step 1: Find eligible border states.
+        // RACER Sec. 3.2 / Fig. 4: matched depth must be >= min_depth
+        // (default 2 in the paper).
         while (u != root) {
             if (u->children.count(next_token)) {
                 auto v = u->children[next_token];
@@ -390,6 +423,9 @@ public:
         std::nth_element(borders.begin(), borders.begin() + std::min(max_num_draft, static_cast<int>(borders.size())), borders.end(),
             [this](TrieNode* a, TrieNode* b) { return a->freq > b->freq; }); // Sort borders based on frequency (decending order)
 
+        // Step 2: Pool continuation states across borders and keep
+        // globally frequent retrieval candidates.
+        // RACER Sec. 3.2, Expansion Rule; see Appendix E.4.
         // ((-freq, depth), (u, start_u))
         std::priority_queue<std::pair<std::pair<int, int>, std::pair<TrieNode*, TrieNode*>>> top_k; // Min-heap to keep track of the top_k nodes based on frequency
         
@@ -498,8 +534,11 @@ public:
         }
 
         if (token_bin) {
-            // Same root, node count + 1
+            // Step 3: Give the remaining fixed draft capacity to Logits Tree.
+            // RACER Sec. 3.3.
             auto aux_candidates = token_bin->retrieve(is_chain ? candidate.back() : next_token, max_num_draft - selected.size(), is_chain);
+            // Step 4: Merge retrieval and logits candidates by trie union.
+            // RACER Sec. 3.3.
             for (auto aux_candidate : aux_candidates) {
                 if (is_chain) {
                     aux_candidate.insert(aux_candidate.begin(), candidate.begin(), candidate.end() - 1);
