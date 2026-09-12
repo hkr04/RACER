@@ -15,6 +15,12 @@
 
 ---
 
+### 📰 News
+
+- **2026-09-12:** RACER is now implemented in SGLang — see [sgl-project/sglang#39211](https://github.com/sgl-project/sglang/pull/39211). Feedback is welcome!
+
+---
+
 ## 📋 Table of Contents
 
 - [Installation](#-installation)
