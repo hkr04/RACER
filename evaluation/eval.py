@@ -5,6 +5,7 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 """
 # adapted from fastchat: https://github.com/lm-sys/FastChat/blob/main/fastchat/llm_judge/gen_model_answer.py
 
+import argparse
 import json
 import os
 import time
@@ -17,6 +18,47 @@ from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor
 from qwen_vl_utils import process_vision_info
+
+from evaluation.math_score import score_math
+
+MATH_BENCHES = {"gsm8k", "math", "aime", "mgsm"}
+MATH_BOXED_INSTRUCTION = (
+    "Please reason step by step, and put your final answer within \\boxed{}."
+)
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ("yes", "true", "t", "1"):
+        return True
+    if value.lower() in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean, got {value}")
+
+
+def format_math_turn(text, boxed):
+    if not boxed:
+        return text
+    return text.rstrip() + "\n" + MATH_BOXED_INSTRUCTION
+
+
+def render_chat(tokenizer_or_processor, messages, extra_args):
+    template_kwargs = {}
+    if extra_args.get("enable_thinking") is not None:
+        template_kwargs["enable_thinking"] = extra_args["enable_thinking"]
+    return tokenizer_or_processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+
+
+def model_extra_args(extra_args):
+    """Drop chat-template keys before they are unpacked into the model forward."""
+    return {key: value for key, value in extra_args.items() if key != "enable_thinking"}
+
 
 def run_eval(
         model,
@@ -31,9 +73,13 @@ def run_eval(
         num_choices,
         num_gpus_per_model,
         num_gpus_total,
+        bench_name=None,
         **kwargs,
 ):
     questions = load_questions(question_file, question_begin, question_end)
+    boxed = bench_name in MATH_BENCHES
+    if boxed:
+        print(f"Math eval ({bench_name}): {len(questions)} questions")
 
     # Split the question file into `num_gpus` files
     assert num_gpus_total % num_gpus_per_model == 0
@@ -74,12 +120,16 @@ def run_eval(
                 answer_file,
                 max_new_tokens,
                 num_choices,
+                boxed,
                 **kwargs,
             )
         )
 
     if use_ray:
         ray.get(ans_handles)
+
+    if boxed:
+        score_math(questions, answer_file)
 
 
 @torch.inference_mode()
@@ -93,8 +143,10 @@ def get_model_answers(
         answer_file,
         max_new_tokens,
         num_choices,
+        boxed=False,
         **kwargs,
 ):
+    shared_extra_args = dict(kwargs.pop("extra_args", {}) or {})
 
     model.eval()
     print('Check model training state:', model.training)
@@ -126,13 +178,11 @@ def get_model_answers(
             qs = question["turns"][j]
             messages.append({
                 "role": "user",
-                "content": qs
+                "content": format_math_turn(qs, boxed)
             })
-            extra_args = {}
+            extra_args = dict(shared_extra_args)
             if processor:
-                text = processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                text = render_chat(processor, messages, extra_args)
                 image_inputs, video_inputs = process_vision_info(messages)
                 inputs = processor(
                     text=[text],
@@ -151,7 +201,7 @@ def get_model_answers(
                 if "video_grid_thw" in inputs:
                     extra_args["video_grid_thw"] = inputs.video_grid_thw
             else:
-                text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                text = render_chat(tokenizer, messages, extra_args)
                 inputs = tokenizer(text, return_tensors="pt", padding=False).to(model.base_model.device)
                 input_ids = inputs.input_ids
             try:
@@ -162,7 +212,7 @@ def get_model_answers(
                     model,
                     tokenizer,
                     max_new_tokens,
-                    extra_args=extra_args,
+                    extra_args=model_extra_args(extra_args),
                     **kwargs,
                 )
                 torch.cuda.synchronize()
@@ -232,13 +282,11 @@ def get_model_answers(
                 qs = question["turns"][j]
                 messages.append({
                     "role": "user",
-                    "content": qs
+                    "content": format_math_turn(qs, boxed)
                 })
-                extra_args = {}
+                extra_args = dict(shared_extra_args)
                 if processor:
-                    text = processor.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                    text = render_chat(processor, messages, extra_args)
                     image_inputs, video_inputs = process_vision_info(messages)
                     inputs = processor(
                         text=[text],
@@ -257,7 +305,7 @@ def get_model_answers(
                     if "video_grid_thw" in inputs:
                         extra_args["video_grid_thw"] = inputs.video_grid_thw
                 else:
-                    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    text = render_chat(tokenizer, messages, extra_args)
                     inputs = tokenizer(text, return_tensors="pt", padding=False).to(model.base_model.device)
                     input_ids = inputs.input_ids
                 try:
@@ -268,7 +316,7 @@ def get_model_answers(
                         model,
                         tokenizer,
                         max_new_tokens,
-                        extra_args=extra_args,
+                        extra_args=model_extra_args(extra_args),
                         **kwargs,
                     )
                     torch.cuda.synchronize()

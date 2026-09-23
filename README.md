@@ -31,6 +31,7 @@
   - [Evaluation](#evaluation)
   - [Speed Analysis](#speed-analysis)
   - [Free Chat](#free-chat)
+- [Benchmarks](docs/benchmarks.md)
 - [Acknowledgement](#acknowledgement)
 
 ---
@@ -87,17 +88,18 @@ These tests cover Logits Tree breadth (Eq. 3 / Algorithm 1), Tree Attention (Eq.
 
 ### Evaluation
 
-Run benchmarks to measure mean accepted tokens and speedup ratios:
+Run benchmarks to measure mean accepted tokens and speedup ratios. Dataset sources, math scoring, and the full `--bench-name` list are in [docs/benchmarks.md](docs/benchmarks.md).
+
+For a quick sanity check, run GSM8K with thinking turned off on the first 20 questions:
 
 ```bash
-# Example: Evaluate Qwen3-1.7B on MGSM-ZH
 CUDA_VISIBLE_DEVICES=0 python -m evaluation.inference_racer \
   --model-path qwen/qwen3-1.7b \
   --model-id qwen3-1.7b-racer \
-  --bench-name mgsm
+  --bench-name gsm8k \
+  --enable-thinking False \
+  --question-end 20
 ```
-
-> **`--bench-name`** accepts: `spec_bench` | `human_eval` | `mgsm` | `gsm8k` | `math` | `aime` | &nbsp;(default: `spec_bench`)
 
 ---
 

@@ -7,7 +7,11 @@ import torch
 import argparse
 from fastchat.utils import str_to_torch_dtype
 
-from evaluation.eval import run_eval, reorg_answer_file
+from evaluation.eval import (
+    reorg_answer_file,
+    run_eval,
+    str2bool,
+)
 
 from evaluation.model.eagle3.eagle3_model import Eagle3Model
 from evaluation.model.eagle3.utils import *
@@ -60,6 +64,16 @@ if __name__ == "__main__":
         type=int,
         default=1024,
         help="The maximum number of new generated tokens.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        type=str2bool,
+        default=None,
+        help=(
+            "Put enable_thinking in extra_args for the chat template. "
+            "Use False to disable thinking on models such as Qwen3. "
+            "Omit it to keep the template default."
+        ),
     )
     parser.add_argument(
         "--total-token",
@@ -149,6 +163,11 @@ if __name__ == "__main__":
         question_file=question_file,
         question_begin=args.question_begin,
         question_end=args.question_end,
+        bench_name=args.bench_name,
+        extra_args=(
+            {} if args.enable_thinking is None
+            else {"enable_thinking": args.enable_thinking}
+        ),
         answer_file=answer_file,
         max_new_tokens=args.max_new_tokens,
         num_choices=args.num_choices,

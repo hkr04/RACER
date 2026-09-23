@@ -6,7 +6,11 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 import argparse
 from fastchat.utils import str_to_torch_dtype
 
-from evaluation.eval import run_eval, reorg_answer_file
+from evaluation.eval import (
+    reorg_answer_file,
+    run_eval,
+    str2bool,
+)
 
 from racer.model.utils import *
 from racer.model.racer_model import RacerModel
@@ -103,6 +107,16 @@ if __name__ == "__main__":
         help="The maximum number of new generated tokens.",
     )
     parser.add_argument(
+        "--enable-thinking",
+        type=str2bool,
+        default=None,
+        help=(
+            "Put enable_thinking in extra_args for the chat template. "
+            "Use False to disable thinking on models such as Qwen3. "
+            "Omit it to keep the template default."
+        ),
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=None,
@@ -175,6 +189,11 @@ if __name__ == "__main__":
         question_file=question_file,
         question_begin=args.question_begin,
         question_end=args.question_end,
+        bench_name=args.bench_name,
+        extra_args=(
+            {} if args.enable_thinking is None
+            else {"enable_thinking": args.enable_thinking}
+        ),
         answer_file=answer_file,
         max_new_tokens=args.max_new_tokens,
         max_tokens=args.max_tokens,
