@@ -83,7 +83,7 @@ def reset_past_key_values(passed_key_values):
     return passed_key_values
 
 
-def generate_draft_tree(logits, ac, pad_token_id, top_p=0., temperature=1., max_num_draft=64, is_draft_chain=False, device="cuda"):
+def generate_draft_tree(logits, ac, pad_token_id, top_p=0., temperature=1., max_num_draft=64, is_draft_chain=False, device="cuda", next_token=None):
     """
     Generate candidates based on provided logits and indices.
     
@@ -101,8 +101,11 @@ def generate_draft_tree(logits, ac, pad_token_id, top_p=0., temperature=1., max_
              retrieve_indices (indices for reordering the logits, mapping each prefix to a BFS index).
     """
 
-    # Greedy decoding: Select the most probable candidate from the original logits.
-    if top_p == 0:
+    # next_token is the residual sample from a rejected draft. Drawing again
+    # from the full nucleus distribution would bias that token toward the draft.
+    if next_token is not None:
+        next_token = next_token.reshape(-1)[:1].to(device=logits.device)
+    elif top_p == 0:
         next_token = torch.argmax(logits[:, -1]).unsqueeze(0)
     else:
         assert top_p < 1, "top_p should between 0.0 and 1"
@@ -119,8 +122,7 @@ def generate_draft_tree(logits, ac, pad_token_id, top_p=0., temperature=1., max_
     tree_position_ids = buf.position_ids
     retrieve_indices = buf.retrieve_indices
     
-    # Make sure length of BFS seq is at least 2
-    # Otherwise `get_nucleus_posterior_mask` might run into an error
+    # Keep a padding slot so the tree has at least two positions.
     if len(tree_candidates) <= 1:
         candidates = [[next_token.item(), pad_token_id]]
         tree_candidates = [next_token.item(), pad_token_id]
@@ -186,46 +188,8 @@ def tree_decoding(
 
     return logits, outputs, tree_logits
 
-def get_nucleus_posterior_mask(logits, candidates, temperature, top_p):
-
-    # adapted from https://github.com/huggingface/transformers/blob/18a879f47576822aa1a5c49aecb27d89bfa5fa69/examples/run_generation.py#L79
-
-    # Apply temperature
-    logits = logits[:, :-1] / temperature
-
-    n_samples, n_tokens = logits.shape[0], logits.shape[1]
-    logits = logits.view(n_samples*n_tokens, -1)
-
-    # Convert to probabilities (softmax)
-    probs = F.softmax(logits, dim=-1)
-    # Sort the probabilities
-    sorted_logits, sorted_indices = torch.sort(probs, descending=True)
-
-    # Compute cumulative probabilities
-    cum_probs = torch.cumsum(sorted_logits, dim=-1)
-
-    # Create mask for the top-p nucleus
-    sorted_indices_to_remove = cum_probs > top_p
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = 0
-
-    indices_to_remove = sorted_indices_to_remove.scatter(dim=1, index=sorted_indices, src=sorted_indices_to_remove)
-
-
-    # Remove low-probability tokens
-    logits[indices_to_remove] = float('-inf')
-
-    # Sample from the remaining tokens
-    sampled_tokens = torch.multinomial(F.softmax(logits, dim=-1), 1).to(device=candidates.device)
-    sampled_tokens = sampled_tokens.view(n_samples, n_tokens)
-    # Create a mask for selected tokens
-    posterior_mask = (candidates[:, 1:] == sampled_tokens).int()
-
-    return posterior_mask
-
-
 def evaluate_posterior(
-    logits, candidates, temperature, top_p=0.8
+    logits, candidates, temperature, top_p=0.8, pad_token_id=None
 ):
     """
     Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
@@ -237,9 +201,12 @@ def evaluate_posterior(
     - logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
     - candidates (torch.Tensor): Candidate token sequences.
     - temperature (float): Softmax temperature for probability scaling. A value of 0 indicates greedy decoding.
+    - pad_token_id (int): Filler id past the end of a draft path. Skipped during sampling.
     Returns:
     - best_candidate (torch.Tensor): Index of the chosen best candidate.
-    - accept_length (int): Length of the accepted candidate sequence.
+    - accept_length (int): Length of the accepted candidate sequence, not counting the root token.
+    - next_token (torch.Tensor or None): Sample to use as the next root after a rejection.
+      None when that root should be drawn from the unmodified target distribution.
     """
     # Greedy decoding based on temperature value
     if temperature == 0:
@@ -255,19 +222,69 @@ def evaluate_posterior(
             best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
         else:
             best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, accept_length
+        return best_candidate, accept_length, None
     elif top_p > 0:
         assert top_p < 1.0, "top_p should between 0 and 1"
-        posterior_mask = get_nucleus_posterior_mask(logits, candidates, temperature, top_p)
-        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
-        accept_length = candidates_accept_length.max()
-        # Choose the best candidate
-        if accept_length == 0:
-            # Default to the first candidate if none are accepted
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, accept_length
+        # Try each distinct sibling with acceptance probability p(x), then drop
+        # its mass and renormalize. Same marginal as sampling from p directly.
+        # accepted_prefix_len counts the root. The returned accept length does not.
+        best_candidate_index = 0
+        accepted_prefix_len = 1
+        rejected_draft = False
+        target_probs = None
+        for position in range(1, candidates.shape[1]):
+            if position != accepted_prefix_len:
+                break
+            rejected_draft = False
+            matches_prefix = (
+                candidates[:, :accepted_prefix_len]
+                == candidates[best_candidate_index, :accepted_prefix_len]
+            ).all(dim=1)
+            prefix_row = torch.nonzero(matches_prefix, as_tuple=True)[0][0]
+            token_logits = (logits[prefix_row, position - 1].unsqueeze(0) / temperature).clone()
+            target_probs = F.softmax(top_p_filtering(token_logits, top_p=top_p), dim=-1)[0].clone()
+            seen_token_ids = set()
+            for candidate_index in range(candidates.shape[0]):
+                if not bool(matches_prefix[candidate_index]):
+                    continue
+                draft_token_id = int(candidates[candidate_index, position])
+                if (
+                    draft_token_id == -1
+                    or draft_token_id == pad_token_id
+                    or draft_token_id in seen_token_ids
+                ):
+                    continue
+                seen_token_ids.add(draft_token_id)
+                draft_prob = float(target_probs[draft_token_id])
+                # Tokens removed by nucleus filtering are not part of p.
+                if draft_prob <= 0:
+                    continue
+                if torch.rand(()).item() <= draft_prob:
+                    best_candidate_index = candidate_index
+                    accepted_prefix_len += 1
+                    break
+                target_probs[draft_token_id] = 0
+                prob_sum = target_probs.sum()
+                if prob_sum > 0:
+                    target_probs = target_probs / prob_sum
+                rejected_draft = True
+        # A full accept leaves the residual stale: it belongs to the last draft
+        # position, while the next token still needs the unmodified distribution.
+        next_token = None
+        if (
+            rejected_draft
+            and accepted_prefix_len != candidates.shape[1]
+            and target_probs is not None
+            and target_probs.sum().item() > 0
+        ):
+            next_token = torch.multinomial(target_probs, 1).view(-1)
+        best_candidate = torch.tensor(
+            best_candidate_index, dtype=torch.long, device=candidates.device
+        )
+        accept_length = torch.tensor(
+            accepted_prefix_len - 1, dtype=torch.long, device=candidates.device
+        )
+        return best_candidate, accept_length, next_token
     else:
         raise NotImplementedError
 

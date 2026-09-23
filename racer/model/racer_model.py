@@ -231,6 +231,7 @@ class RacerModel(nn.Module):
         if show_accepted:
             accepted_texts = []
 
+        next_token = None
         for idx in range(max_steps):
             # Automaton will receive the next token predicted by the logit in this function
             candidates, tree_candidates, tree_attn_mask, tree_position_ids, retrieve_indices = generate_draft_tree(
@@ -240,7 +241,8 @@ class RacerModel(nn.Module):
                 top_p=top_p,
                 temperature=temperature,
                 max_num_draft=max_num_draft,
-                device=self.base_model.device
+                device=self.base_model.device,
+                next_token=next_token,
             )
             tree_candidates = tree_candidates[None, :]
             tree_attn_mask = tree_attn_mask[None, None, :]
@@ -255,8 +257,8 @@ class RacerModel(nn.Module):
                 retrieve_indices
             )
             
-            best_candidate, accept_length = evaluate_posterior(
-                logits, candidates, temperature, top_p
+            best_candidate, accept_length, next_token = evaluate_posterior(
+                logits, candidates, temperature, top_p, pad_token_id=pad_token_id
             )
             input_ids, logits, new_token, accept_length = update_inference_inputs(
                 input_ids,

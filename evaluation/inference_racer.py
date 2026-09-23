@@ -66,6 +66,8 @@ def racer_forward(inputs, model, tokenizer, max_new_tokens, max_tokens, temperat
             ac.insert(pattern)
         ac.build()
     
+    next_token = None
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     for idx in range(max_new_tokens): 
         if max_tokens - input_ids.size(-1) < max_num_draft:
             max_num_draft = max_tokens - input_ids.size(-1)
@@ -73,11 +75,12 @@ def racer_forward(inputs, model, tokenizer, max_new_tokens, max_tokens, temperat
         candidates, tree_candidates, tree_attn_mask, tree_position_ids, retrieve_indices = generate_draft_tree(
             logits=logits,
             ac=ac,
-            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+            pad_token_id=pad_token_id,
             top_p=top_p,
             temperature=temperature,
             max_num_draft=max_num_draft,
-            device=model.base_model.device
+            device=model.base_model.device,
+            next_token=next_token,
         )
         tree_candidates = tree_candidates[None, :]
         tree_attn_mask = tree_attn_mask[None, None, :]
@@ -92,8 +95,8 @@ def racer_forward(inputs, model, tokenizer, max_new_tokens, max_tokens, temperat
             retrieve_indices
         )
         
-        best_candidate, accept_length = evaluate_posterior(
-            logits, candidates, temperature, top_p
+        best_candidate, accept_length, next_token = evaluate_posterior(
+            logits, candidates, temperature, top_p, pad_token_id=pad_token_id
         )
         input_ids, logits, new_token, accept_length = update_inference_inputs(
             input_ids,

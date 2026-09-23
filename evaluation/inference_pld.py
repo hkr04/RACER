@@ -85,9 +85,12 @@ def pld_forward(inputs, model, tokenizer, max_new_tokens, max_tokens, temperatur
         input_ids, model, past_key_values
     )
     new_token = 0
+    next_token = None
 
     for idx in range(max_new_tokens): 
-        if top_p > 0:
+        if next_token is not None:
+            next_token = next_token.view(1, 1)
+        elif top_p > 0:
             assert top_p < 1, "top_p should between 0.0 and 1"
             next_token_logits = logits[:, -1, :]
             next_token_logits = next_token_logits / (temperature if temperature > 0 else 1.)
@@ -117,7 +120,7 @@ def pld_forward(inputs, model, tokenizer, max_new_tokens, max_tokens, temperatur
         )
         
         # Only one candidate, best_candidate must be 0
-        best_candidate, accept_length = evaluate_posterior(
+        best_candidate, accept_length, next_token = evaluate_posterior(
             logits, candidates, temperature, top_p
         )
         # Just for compatibility

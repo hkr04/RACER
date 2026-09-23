@@ -18,12 +18,13 @@ from evaluation.model.eagle3.utils import *
 
 from racer.model.chat_template import VICUNA_CHAT_TEMPLATE
 
-def ea_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, extra_args={}):
+def ea_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, top_p=0.0, extra_args={}):
     input_ids = inputs.input_ids
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
     input_ids, new_token, step, accept_length_list = model.eagle_generate(
         torch.as_tensor(input_ids).cuda(),
         temperature=temperature,
+        top_p=top_p,
         max_new_tokens=max_new_tokens,
         log=True
     )
@@ -114,6 +115,12 @@ if __name__ == "__main__":
         default=0.0,
     )
     parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.0,
+        help="The threshold for nucleus sampling.",
+    )
+    parser.add_argument(
         "--tree-choices",
         type=str,
         default="mc_sim_7b_63",
@@ -174,6 +181,7 @@ if __name__ == "__main__":
         num_gpus_per_model=args.num_gpus_per_model,
         num_gpus_total=args.num_gpus_total,
         temperature=args.temperature,
+        top_p=args.top_p,
     )
 
     reorg_answer_file(answer_file)
